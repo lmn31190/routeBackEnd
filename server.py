@@ -20,8 +20,7 @@ mongo_url = os.getenv("MONGO_URL")
 client = AsyncIOMotorClient(mongo_url)
 db = client[os.environ['DB_NAME']]
 
-if not mongo_url or not db:
-    raise RuntimeError("Missing env vars: MONGO_URL or DB_NAME")
+
 
 # OpenRouteService API
 ORS_API_KEY = os.environ.get('OPENROUTESERVICE_API_KEY', '')
