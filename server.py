@@ -747,8 +747,6 @@ from enum import Enum
 # ==================== ENV ====================
 
 ROOT_DIR = Path(__file__).parent
-
-# Load .env only in local dev (Vercel uses Environment Variables)
 if (ROOT_DIR / ".env").exists():
     load_dotenv(ROOT_DIR / ".env")
 
@@ -760,13 +758,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ==================== MONGODB CONNECTION ====================
+# ==================== MONGODB ====================
 
 mongo_url = os.getenv("MONGO_URL")
 db_name = os.getenv("DB_NAME")
 
-if not mongo_url or not db_name:
-    raise RuntimeError("Missing env vars: MONGO_URL and/or DB_NAME")
+if mongo_url is None or db_name is None:
+    raise RuntimeError("Missing env vars: MONGO_URL or DB_NAME")
 
 client = AsyncIOMotorClient(mongo_url)
 db = client[db_name]
@@ -776,14 +774,9 @@ db = client[db_name]
 ORS_API_KEY = os.getenv("OPENROUTESERVICE_API_KEY", "")
 ORS_BASE_URL = "https://api.openrouteservice.org"
 
-# ==================== FASTAPI APP ====================
+# ==================== APP ====================
 
-app = FastAPI(
-    title="Route Optimizer API",
-    docs_url="/docs",
-    redoc_url="/redoc",
-)
-
+app = FastAPI(title="Route Optimizer API")
 api_router = APIRouter()
 
 # ==================== MODELS ====================
@@ -854,39 +847,44 @@ class GeocodeResult(BaseModel):
     address: str
     coordinates: Coordinate
 
-# ==================== OPENROUTESERVICE FUNCTIONS ====================
+class WaypointUpdate(BaseModel):
+    name: Optional[str] = None
+    address: Optional[str] = None
+    coordinates: Optional[Coordinate] = None
+    status: Optional[WaypointStatus] = None
+    note: Optional[str] = None
+    color: Optional[WaypointColor] = None
+
+# ==================== ORS HELPERS ====================
 
 async def geocode_address(address: str, country: str = "FR") -> Optional[GeocodeResult]:
-    """Geocode an address to coordinates using OpenRouteService, fallback to Nominatim"""
-
+    """Geocode using ORS, fallback to Nominatim"""
     async with httpx.AsyncClient() as client_http:
-        # Try OpenRouteService first
+        # ORS
         try:
-            params = {
-                "api_key": ORS_API_KEY,
-                "text": address,
-                "size": 5,
-                "boundary.country": country,
-                "layers": "address,venue,street",
-            }
-
             response = await client_http.get(
                 f"{ORS_BASE_URL}/geocode/search",
-                params=params,
+                params={
+                    "api_key": ORS_API_KEY,
+                    "text": address,
+                    "size": 5,
+                    "boundary.country": country,
+                    "layers": "address,venue,street",
+                },
                 timeout=10.0,
             )
             response.raise_for_status()
             data = response.json()
 
-            if data.get("features") and len(data["features"]) > 0:
+            if data.get("features"):
                 feature = data["features"][0]
                 coords = feature["geometry"]["coordinates"]
                 props = feature.get("properties", {})
+                label = props.get("label", address)
 
                 house_number = props.get("housenumber", "")
                 street = props.get("street", "")
                 name = props.get("name", "")
-                label = props.get("label", address)
 
                 if house_number and street:
                     display_name = f"{house_number} {street}"
@@ -903,9 +901,8 @@ async def geocode_address(address: str, country: str = "FR") -> Optional[Geocode
         except Exception as e:
             logger.error(f"ORS Geocoding error: {e}")
 
-        # Fallback to Nominatim
+        # Nominatim fallback
         try:
-            logger.info(f"Trying Nominatim fallback for: {address}")
             nominatim_response = await client_http.get(
                 "https://nominatim.openstreetmap.org/search",
                 params={
@@ -921,10 +918,9 @@ async def geocode_address(address: str, country: str = "FR") -> Optional[Geocode
             nominatim_response.raise_for_status()
             nominatim_data = nominatim_response.json()
 
-            if nominatim_data and len(nominatim_data) > 0:
+            if nominatim_data:
                 result = nominatim_data[0]
                 addr = result.get("address", {})
-
                 house_number = addr.get("house_number", "")
                 road = addr.get("road", "")
 
@@ -946,8 +942,8 @@ async def geocode_address(address: str, country: str = "FR") -> Optional[Geocode
 
         return None
 
-async def calculate_route(coordinates: List[List[float]], profile: str) -> dict:
-    """Calculate route using OpenRouteService Directions API"""
+async def calculate_route_ors(coordinates: List[List[float]], profile: str) -> dict:
+    """ORS Directions API"""
     async with httpx.AsyncClient() as client_http:
         try:
             response = await client_http.post(
@@ -956,33 +952,21 @@ async def calculate_route(coordinates: List[List[float]], profile: str) -> dict:
                     "Authorization": ORS_API_KEY,
                     "Content-Type": "application/json",
                 },
-                json={
-                    "coordinates": coordinates,
-                    "instructions": False,
-                },
+                json={"coordinates": coordinates, "instructions": False},
                 timeout=30.0,
             )
-
             if response.status_code != 200:
-                error_detail = response.text
-                logger.error(f"ORS API error: {response.status_code} - {error_detail}")
-                raise HTTPException(
-                    status_code=500,
-                    detail=f"Route calculation failed: {error_detail}",
-                )
-
+                logger.error(f"ORS API error {response.status_code}: {response.text}")
+                raise HTTPException(status_code=500, detail="Route calculation failed")
             return response.json()
         except HTTPException:
             raise
         except Exception as e:
             logger.error(f"Route calculation error: {e}")
-            raise HTTPException(
-                status_code=500,
-                detail=f"Route calculation failed: {str(e)}",
-            )
+            raise HTTPException(status_code=500, detail=f"Route calculation failed: {e}")
 
-async def optimize_route(jobs: List[dict], vehicle: dict) -> dict:
-    """Optimize route order using OpenRouteService Optimization API (VROOM)"""
+async def optimize_route_ors(jobs: List[dict], vehicle: dict) -> dict:
+    """ORS Optimization API"""
     async with httpx.AsyncClient() as client_http:
         try:
             response = await client_http.post(
@@ -991,22 +975,16 @@ async def optimize_route(jobs: List[dict], vehicle: dict) -> dict:
                     "Authorization": ORS_API_KEY,
                     "Content-Type": "application/json",
                 },
-                json={
-                    "jobs": jobs,
-                    "vehicles": [vehicle],
-                },
+                json={"jobs": jobs, "vehicles": [vehicle]},
                 timeout=30.0,
             )
             response.raise_for_status()
             return response.json()
         except Exception as e:
             logger.error(f"Route optimization error: {e}")
-            raise HTTPException(
-                status_code=500,
-                detail=f"Route optimization failed: {str(e)}",
-            )
+            raise HTTPException(status_code=500, detail=f"Route optimization failed: {e}")
 
-# ==================== API ENDPOINTS ====================
+# ==================== ENDPOINTS ====================
 
 @api_router.get("/")
 async def root():
@@ -1016,25 +994,121 @@ async def root():
 async def geocode(address: str):
     if not address:
         raise HTTPException(status_code=400, detail="Address is required")
-
     result = await geocode_address(address)
-
     if result:
         response = result.model_dump()
-
         original_parts = address.strip().split()
         if original_parts and original_parts[0].isdigit():
             response["name"] = address.split(",")[0].strip()
-            response["address"] = f"{address.split(',')[0].strip()}, {result.address.split(',', 1)[-1].strip() if ',' in result.address else result.address}"
-
+            response["address"] = (
+                f"{address.split(',')[0].strip()}, "
+                f"{result.address.split(',', 1)[-1].strip() if ',' in result.address else result.address}"
+            )
         return response
-
     raise HTTPException(status_code=404, detail="Address not found")
+
+@api_router.get("/autocomplete")
+async def autocomplete_address(text: str):
+    if not text or len(text) < 3:
+        return {"suggestions": []}
+
+    suggestions = []
+    async with httpx.AsyncClient() as client_http:
+        # ORS autocomplete
+        try:
+            response = await client_http.get(
+                f"{ORS_BASE_URL}/geocode/autocomplete",
+                params={
+                    "api_key": ORS_API_KEY,
+                    "text": text,
+                    "boundary.country": "FR",
+                    "size": 5,
+                },
+                timeout=5.0,
+            )
+            response.raise_for_status()
+            data = response.json()
+
+            for feature in data.get("features", []):
+                props = feature.get("properties", {})
+                coords = feature["geometry"]["coordinates"]
+
+                house_number = props.get("housenumber", "")
+                street = props.get("street", "")
+                name = props.get("name", "")
+                label = props.get("label", "")
+
+                if house_number and street:
+                    display_name = f"{house_number} {street}"
+                elif name:
+                    display_name = name
+                else:
+                    display_name = label.split(",")[0] if label else text
+
+                suggestions.append(
+                    {
+                        "name": display_name,
+                        "address": label,
+                        "coordinates": {"longitude": coords[0], "latitude": coords[1]},
+                        "source": "ors",
+                    }
+                )
+        except Exception as e:
+            logger.error(f"ORS Autocomplete error: {e}")
+
+        # Nominatim supplement
+        if len(suggestions) < 3:
+            try:
+                nominatim_response = await client_http.get(
+                    "https://nominatim.openstreetmap.org/search",
+                    params={
+                        "q": text,
+                        "format": "json",
+                        "limit": 5,
+                        "countrycodes": "fr",
+                        "addressdetails": 1,
+                    },
+                    headers={"User-Agent": "RouteOptimizer/1.0"},
+                    timeout=5.0,
+                )
+                nominatim_response.raise_for_status()
+                nominatim_data = nominatim_response.json()
+                existing = {s["address"].lower() for s in suggestions}
+
+                for result in nominatim_data:
+                    display_name_full = result.get("display_name", "")
+                    if display_name_full.lower() in existing:
+                        continue
+                    addr = result.get("address", {})
+                    house_number = addr.get("house_number", "")
+                    road = addr.get("road", "")
+
+                    if house_number and road:
+                        display_name = f"{house_number} {road}"
+                    else:
+                        display_name = display_name_full.split(",")[0]
+
+                    suggestions.append(
+                        {
+                            "name": display_name,
+                            "address": display_name_full,
+                            "coordinates": {
+                                "longitude": float(result["lon"]),
+                                "latitude": float(result["lat"]),
+                            },
+                            "source": "nominatim",
+                        }
+                    )
+                    if len(suggestions) >= 5:
+                        break
+            except Exception as e:
+                logger.error(f"Nominatim Autocomplete error: {e}")
+
+    return {"suggestions": suggestions[:5]}
 
 @api_router.post("/routes", response_model=RouteResponse)
 async def create_route(route: RouteCreate):
     now = datetime.now(timezone.utc).isoformat()
-
     route_doc = {
         "id": str(uuid.uuid4()),
         "name": route.name,
@@ -1049,15 +1123,13 @@ async def create_route(route: RouteCreate):
         "created_at": now,
         "updated_at": now,
     }
-
     await db.routes.insert_one(route_doc)
     route_doc.pop("_id", None)
     return route_doc
 
 @api_router.get("/routes", response_model=List[RouteResponse])
 async def get_routes():
-    routes = await db.routes.find({}, {"_id": 0}).to_list(100)
-    return routes
+    return await db.routes.find({}, {"_id": 0}).to_list(100)
 
 @api_router.get("/routes/{route_id}", response_model=RouteResponse)
 async def get_route(route_id: str):
@@ -1066,7 +1138,255 @@ async def get_route(route_id: str):
         raise HTTPException(status_code=404, detail="Route not found")
     return route
 
-# ==================== REGISTER ROUTER + CORS ====================
+@api_router.put("/routes/{route_id}", response_model=RouteResponse)
+async def update_route(route_id: str, route_update: RouteUpdate):
+    existing = await db.routes.find_one({"id": route_id})
+    if not existing:
+        raise HTTPException(status_code=404, detail="Route not found")
+
+    update_data = {}
+    if route_update.name is not None:
+        update_data["name"] = route_update.name
+    if route_update.start is not None:
+        update_data["start"] = route_update.start.model_dump()
+    if route_update.end is not None:
+        update_data["end"] = route_update.end.model_dump()
+    if route_update.waypoints is not None:
+        update_data["waypoints"] = [wp.model_dump() for wp in route_update.waypoints]
+    if route_update.profile is not None:
+        update_data["profile"] = route_update.profile.value
+
+    update_data["updated_at"] = datetime.now(timezone.utc).isoformat()
+
+    await db.routes.update_one({"id": route_id}, {"$set": update_data})
+    return await db.routes.find_one({"id": route_id}, {"_id": 0})
+
+@api_router.delete("/routes/{route_id}")
+async def delete_route(route_id: str):
+    result = await db.routes.delete_one({"id": route_id})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Route not found")
+    return {"message": "Route deleted successfully"}
+
+@api_router.post("/routes/{route_id}/calculate", response_model=RouteResponse)
+async def calculate_route_directions(route_id: str):
+    route = await db.routes.find_one({"id": route_id}, {"_id": 0})
+    if not route:
+        raise HTTPException(status_code=404, detail="Route not found")
+
+    coordinates = [
+        [route["start"]["coordinates"]["longitude"], route["start"]["coordinates"]["latitude"]],
+        *[[wp["coordinates"]["longitude"], wp["coordinates"]["latitude"]] for wp in route.get("waypoints", [])],
+        [route["end"]["coordinates"]["longitude"], route["end"]["coordinates"]["latitude"]],
+    ]
+
+    result = await calculate_route_ors(coordinates, route["profile"])
+
+    if result.get("features"):
+        props = result["features"][0].get("properties", {})
+        summary = props.get("summary", {})
+        await db.routes.update_one(
+            {"id": route_id},
+            {"$set": {
+                "distance": summary.get("distance", 0),
+                "duration": summary.get("duration", 0),
+                "geometry": result["features"][0].get("geometry"),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }},
+        )
+
+    return await db.routes.find_one({"id": route_id}, {"_id": 0})
+
+@api_router.post("/routes/{route_id}/optimize", response_model=RouteResponse)
+async def optimize_route_order(route_id: str):
+    route = await db.routes.find_one({"id": route_id}, {"_id": 0})
+    if not route:
+        raise HTTPException(status_code=404, detail="Route not found")
+
+    waypoints = route.get("waypoints", [])
+    if len(waypoints) < 2:
+        raise HTTPException(status_code=400, detail="Need at least 2 waypoints to optimize")
+
+    jobs = [
+        {"id": idx, "location": [wp["coordinates"]["longitude"], wp["coordinates"]["latitude"]], "service": 300}
+        for idx, wp in enumerate(waypoints)
+    ]
+
+    vehicle = {
+        "id": 0,
+        "profile": route["profile"],
+        "start": [route["start"]["coordinates"]["longitude"], route["start"]["coordinates"]["latitude"]],
+        "end": [route["end"]["coordinates"]["longitude"], route["end"]["coordinates"]["latitude"]],
+    }
+
+    result = await optimize_route_ors(jobs, vehicle)
+
+    optimized_order = []
+    if result.get("routes"):
+        for step in result["routes"][0].get("steps", []):
+            if step.get("type") == "job":
+                optimized_order.append(step["job"])
+
+    if optimized_order:
+        new_waypoints = [waypoints[i] for i in optimized_order if i < len(waypoints)]
+        await db.routes.update_one(
+            {"id": route_id},
+            {"$set": {
+                "waypoints": new_waypoints,
+                "optimized_order": optimized_order,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }},
+        )
+
+    updated = await db.routes.find_one({"id": route_id}, {"_id": 0})
+
+    coords = [
+        [updated["start"]["coordinates"]["longitude"], updated["start"]["coordinates"]["latitude"]],
+        *[[wp["coordinates"]["longitude"], wp["coordinates"]["latitude"]] for wp in updated.get("waypoints", [])],
+        [updated["end"]["coordinates"]["longitude"], updated["end"]["coordinates"]["latitude"]],
+    ]
+
+    route_result = await calculate_route_ors(coords, updated["profile"])
+
+    if route_result.get("features"):
+        props = route_result["features"][0].get("properties", {})
+        summary = props.get("summary", {})
+        await db.routes.update_one(
+            {"id": route_id},
+            {"$set": {
+                "distance": summary.get("distance", 0),
+                "duration": summary.get("duration", 0),
+                "geometry": route_result["features"][0].get("geometry"),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }},
+        )
+
+    return await db.routes.find_one({"id": route_id}, {"_id": 0})
+
+@api_router.post("/routes/{route_id}/waypoints", response_model=RouteResponse)
+async def add_waypoint(route_id: str, waypoint: Waypoint):
+    route = await db.routes.find_one({"id": route_id})
+    if not route:
+        raise HTTPException(status_code=404, detail="Route not found")
+
+    waypoints = route.get("waypoints", [])
+    waypoints.append(waypoint.model_dump())
+
+    await db.routes.update_one(
+        {"id": route_id},
+        {"$set": {
+            "waypoints": waypoints,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "geometry": None,
+            "distance": None,
+            "duration": None,
+        }},
+    )
+
+    return await db.routes.find_one({"id": route_id}, {"_id": 0})
+
+@api_router.delete("/routes/{route_id}/waypoints/{waypoint_id}", response_model=RouteResponse)
+async def remove_waypoint(route_id: str, waypoint_id: str):
+    route = await db.routes.find_one({"id": route_id})
+    if not route:
+        raise HTTPException(status_code=404, detail="Route not found")
+
+    waypoints = [wp for wp in route.get("waypoints", []) if wp["id"] != waypoint_id]
+
+    await db.routes.update_one(
+        {"id": route_id},
+        {"$set": {
+            "waypoints": waypoints,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "geometry": None,
+            "distance": None,
+            "duration": None,
+        }},
+    )
+
+    return await db.routes.find_one({"id": route_id}, {"_id": 0})
+
+@api_router.patch("/routes/{route_id}/waypoints/{waypoint_id}/status", response_model=RouteResponse)
+async def update_waypoint_status(route_id: str, waypoint_id: str, status: WaypointStatus):
+    route = await db.routes.find_one({"id": route_id})
+    if not route:
+        raise HTTPException(status_code=404, detail="Route not found")
+
+    waypoints = route.get("waypoints", [])
+    updated = False
+
+    for wp in waypoints:
+        if wp["id"] == waypoint_id:
+            wp["status"] = status.value
+            updated = True
+            break
+
+    if not updated:
+        raise HTTPException(status_code=404, detail="Waypoint not found")
+
+    await db.routes.update_one(
+        {"id": route_id},
+        {"$set": {"waypoints": waypoints, "updated_at": datetime.now(timezone.utc).isoformat()}},
+    )
+
+    return await db.routes.find_one({"id": route_id}, {"_id": 0})
+
+@api_router.patch("/routes/{route_id}/waypoints/{waypoint_id}", response_model=RouteResponse)
+async def update_waypoint(route_id: str, waypoint_id: str, update: WaypointUpdate):
+    route = await db.routes.find_one({"id": route_id})
+    if not route:
+        raise HTTPException(status_code=404, detail="Route not found")
+
+    waypoints = route.get("waypoints", [])
+    updated = False
+
+    for wp in waypoints:
+        if wp["id"] == waypoint_id:
+            if update.name is not None:
+                wp["name"] = update.name
+            if update.address is not None:
+                wp["address"] = update.address
+            if update.coordinates is not None:
+                wp["coordinates"] = update.coordinates.model_dump()
+            if update.status is not None:
+                wp["status"] = update.status.value
+            if update.note is not None:
+                wp["note"] = update.note
+            if update.color is not None:
+                wp["color"] = update.color.value
+            updated = True
+            break
+
+    if not updated:
+        raise HTTPException(status_code=404, detail="Waypoint not found")
+
+    await db.routes.update_one(
+        {"id": route_id},
+        {"$set": {"waypoints": waypoints, "updated_at": datetime.now(timezone.utc).isoformat()}},
+    )
+
+    return await db.routes.find_one({"id": route_id}, {"_id": 0})
+
+@api_router.post("/routes/{route_id}/undo", response_model=RouteResponse)
+async def undo_last_waypoint_status(route_id: str):
+    route = await db.routes.find_one({"id": route_id})
+    if not route:
+        raise HTTPException(status_code=404, detail="Route not found")
+
+    waypoints = route.get("waypoints", [])
+    for wp in reversed(waypoints):
+        if wp.get("status", "pending") != "pending":
+            wp["status"] = "pending"
+            break
+
+    await db.routes.update_one(
+        {"id": route_id},
+        {"$set": {"waypoints": waypoints, "updated_at": datetime.now(timezone.utc).isoformat()}},
+    )
+
+    return await db.routes.find_one({"id": route_id}, {"_id": 0})
+
+# ==================== MOUNT ROUTES + CORS ====================
 
 app.include_router(api_router)
 
