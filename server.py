@@ -1390,7 +1390,7 @@ async def undo_last_waypoint_status(route_id: str):
 
 app.include_router(api_router)
 
-cors_origins = os.getenv("CORS_ORIGINS", "http://localhost:3000").split(",")
+cors_origins = os.getenv("CORS_ORIGINS", "https://lmoptimizer.netlify.app/").split(",")
 
 app.add_middleware(
     CORSMiddleware,
