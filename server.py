@@ -28,7 +28,7 @@ ORS_BASE_URL = "https://api.openrouteservice.org"
 app = FastAPI(title="Route Optimizer API")
 
 # Create a router with the /api prefix
-api_router = APIRouter(prefix="")
+api_router = APIRouter()
 
 # Configure logging
 logging.basicConfig(
@@ -717,9 +717,8 @@ app.include_router(api_router)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_credentials=False,
-    allow_origins=os.environ.get('CORS_ORIGINS', 'http://localhost:3000').split(','),
-    allow_origins=["*"],
+    allow_credentials=True,
+    allow_origins=os.environ.get("CORS_ORIGINS", "http://localhost:3000").split(","),
     allow_methods=["*"],
     allow_headers=["*"],
 )
